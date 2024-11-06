@@ -1,0 +1,16 @@
+[package]
+name = "sketch_freq"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+eframe = "0.29.1"
+egui = "0.29.1"
+lv2 = "0.6.0"
+rfd = "0.15.0"
+urid = "0.1.0"
+winit = "0.30.5"
+wmidi = "4.0.10"

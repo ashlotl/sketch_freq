@@ -1,0 +1,7 @@
+{
+    "rust-analyzer.procMacro.ignored": {
+        "urid_derive": [
+            "uri"
+        ]
+    }
+}
