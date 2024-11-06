@@ -1,5 +1,52 @@
 use core::f32;
-use std::ops::{Index, IndexMut};
+use std::{
+    ops::{Index, IndexMut},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+        Arc, RwLock,
+    },
+};
+
+pub struct DataWriter {
+    inner: RwLock<Data>,
+    invalidate_cache: Arc<Sender<()>>,
+    reinvalidate_cache: Arc<AtomicBool>,
+}
+
+impl DataWriter {
+    pub fn new(
+        invalidate_cache: Arc<Sender<()>>,
+        reinvalidate_cache: Arc<AtomicBool>,
+        data: Data,
+    ) -> Self {
+        Self {
+            inner: RwLock::new(data),
+            invalidate_cache,
+            reinvalidate_cache,
+        }
+    }
+
+    pub fn read_with<T>(&self, mut with: impl FnMut(&Data) -> T) -> T {
+        with(&self.inner.read().unwrap())
+    }
+
+    /// TO SAVE ON HEADACHES, DO NOT USE THIS FUNCTION IN MULTIPLE THREADS
+    pub fn write_with(&self, mut with: impl FnMut(&mut Data)) {
+        let data = self.inner.read().unwrap();
+        // interrupt current operations on `Data`, namely the recomputation of the cache in `lv2_impl`
+        self.reinvalidate_cache.store(true, Ordering::SeqCst);
+        drop(data);
+        let mut write_lock = self.inner.write().unwrap();
+        // successfully getting the write_lock indicates that the reinvalidation was registered or was unnecessary,
+        // so we set it back to false to avoid spurious reinvalidation
+        self.reinvalidate_cache.store(false, Ordering::SeqCst);
+        with(&mut write_lock);
+        drop(write_lock);
+        //let `lv2_impl` know that it can resume
+        self.invalidate_cache.send(()).unwrap();
+    }
+}
 
 pub struct Data {
     pub semitone_divisions: usize,
@@ -12,9 +59,6 @@ pub struct Data {
     pub amplitude_plot: Vec<u8>,
     pub modulation_plot: Vec<u8>,
     pub pan_plot: Vec<u8>,
-
-    pub caches_invalidated: bool,
-    pub reinvalidate_cache: bool,
 }
 
 impl Index<usize> for Data {
@@ -59,9 +103,6 @@ impl Data {
             amplitude_plot: vec![0; plot_size],
             modulation_plot: vec![0; plot_size],
             pan_plot: vec![0; plot_size],
-
-            caches_invalidated: true,
-            reinvalidate_cache: false,
         }
     }
 

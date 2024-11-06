@@ -1,15 +1,15 @@
 use core::f32;
 use std::sync::{
     atomic::{AtomicI32, AtomicU32, Ordering},
-    Arc, RwLock,
+    Arc,
 };
 
 use egui::{Rect, TextureHandle, TextureOptions};
 
-use crate::shared_data::{ChannelSelection, Data};
+use crate::shared_data::{ChannelSelection, Data, DataWriter};
 
 pub struct Frontend {
-    pub data: Arc<RwLock<Data>>,
+    pub data: Arc<DataWriter>,
     pub plot_texture_handle: Option<TextureHandle>,
 
     /// Index of buffer to fill the red channel of plot texture with.
@@ -35,19 +35,20 @@ pub struct Frontend {
 
 impl Frontend {
     pub fn update_plot(&mut self) {
-        let data = self.data.read().unwrap();
-        let buffer = data.construct_rgba_buffer_from_plots(
-            self.plot_r_channel_binding,
-            self.plot_g_channel_binding,
-            self.plot_b_channel_binding,
-        );
-        self.plot_texture_handle.as_mut().unwrap().set(
-            egui::ColorImage::from_rgba_unmultiplied(
-                [data.x_width_plot(), data.frequency_count as usize],
-                &buffer,
-            ),
-            TextureOptions::NEAREST,
-        )
+        self.data.read_with(|data| {
+            let buffer = data.construct_rgba_buffer_from_plots(
+                self.plot_r_channel_binding,
+                self.plot_g_channel_binding,
+                self.plot_b_channel_binding,
+            );
+            self.plot_texture_handle.as_mut().unwrap().set(
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [data.x_width_plot(), data.frequency_count as usize],
+                    &buffer,
+                ),
+                TextureOptions::NEAREST,
+            )
+        })
     }
 
     pub fn apply_brush(&self, pos: (f32, f32), data: &mut Data) {
@@ -57,8 +58,6 @@ impl Frontend {
             &self.brush_color,
             |(_x, _y), value| *value = 255,
         );
-        data.caches_invalidated = true;
-        data.reinvalidate_cache = true;
     }
 
     pub fn apply_eraser(&self, pos: (f32, f32), data: &mut Data) {
@@ -68,8 +67,6 @@ impl Frontend {
             &self.eraser_color,
             |(_x, _y), value| *value = 0,
         );
-        data.caches_invalidated = true;
-        data.reinvalidate_cache = true;
     }
 }
 
@@ -81,22 +78,22 @@ impl eframe::App for Frontend {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
 
         self.plot_texture_handle.get_or_insert_with(|| {
-            let data = self.data.read().unwrap();
+            self.data.read_with(|data| {
+                let buffer = data.construct_rgba_buffer_from_plots(
+                    self.plot_r_channel_binding,
+                    self.plot_g_channel_binding,
+                    self.plot_b_channel_binding,
+                );
 
-            let buffer = data.construct_rgba_buffer_from_plots(
-                self.plot_r_channel_binding,
-                self.plot_g_channel_binding,
-                self.plot_b_channel_binding,
-            );
-
-            ctx.load_texture(
-                "plot texture",
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [data.x_width_plot(), data.frequency_count as usize],
-                    &buffer,
-                ),
-                TextureOptions::NEAREST,
-            )
+                ctx.load_texture(
+                    "plot texture",
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [data.x_width_plot(), data.frequency_count as usize],
+                        &buffer,
+                    ),
+                    TextureOptions::NEAREST,
+                )
+            })
         });
 
         #[derive(PartialEq)]
@@ -130,28 +127,30 @@ impl eframe::App for Frontend {
 
             if mouse_button == MouseButton::Left {
                 if let Some(interaction_pos) = mouse_pos {
-                    let mut data = self.data.write().unwrap();
-                    let pos = map_from_rect(
-                        (interaction_pos.x, interaction_pos.y),
-                        img_response.rect,
-                        (data.x_width_plot() as f32, data.frequency_count as f32),
-                    );
-                    self.apply_brush(pos, &mut data);
-                    drop(data);
+                    self.data.write_with(|data| {
+                        let pos = map_from_rect(
+                            (interaction_pos.x, interaction_pos.y),
+                            img_response.rect,
+                            (data.x_width_plot() as f32, data.frequency_count as f32),
+                        );
+                        self.apply_brush(pos, data);
+                    });
+
                     self.update_plot();
                 }
             }
 
             if mouse_button == MouseButton::Right {
                 if let Some(interaction_pos) = mouse_pos {
-                    let mut data = self.data.write().unwrap();
-                    let pos = map_from_rect(
-                        (interaction_pos.x, interaction_pos.y),
-                        img_response.rect,
-                        (data.x_width_plot() as f32, data.frequency_count as f32),
-                    );
-                    self.apply_eraser(pos, &mut data);
-                    drop(data);
+                    self.data.write_with(|data| {
+                        let pos = map_from_rect(
+                            (interaction_pos.x, interaction_pos.y),
+                            img_response.rect,
+                            (data.x_width_plot() as f32, data.frequency_count as f32),
+                        );
+                        self.apply_eraser(pos, data);
+                    });
+
                     self.update_plot();
                 }
             }

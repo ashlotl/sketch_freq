@@ -4,6 +4,6 @@ pub mod shared_data;
 
 use lv2::prelude::*;
 
-use crate::lv2_impl::Amp;
+use crate::lv2_impl::SynthWrapper;
 
-lv2_descriptors!(Amp);
+lv2_descriptors!(SynthWrapper);

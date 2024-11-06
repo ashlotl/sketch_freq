@@ -1,9 +1,9 @@
 use core::f32;
 use std::{
-    f64,
     sync::{
-        atomic::{AtomicI32, AtomicU32, Ordering},
-        Arc, RwLock,
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
+        Arc, Mutex,
     },
     thread,
     time::Instant,
@@ -15,7 +15,7 @@ use wmidi::{MidiMessage, Note};
 
 use crate::{
     frontend::Frontend,
-    shared_data::{ChannelSelection, Data},
+    shared_data::{ChannelSelection, Data, DataWriter},
 };
 
 /// time in samples/frames
@@ -31,8 +31,6 @@ pub struct MidiPitchMap(String);
 #[derive(PortCollection)]
 pub struct Ports {
     gain: InputPort<Control>,
-    center_frequency: InputPort<Control>,
-    pitch_scale: InputPort<Control>,
 
     midi_events: InputPort<AtomPort>,
 
@@ -40,33 +38,53 @@ pub struct Ports {
 }
 
 #[uri("https://example.com/changethislater")]
-pub struct Amp {
-    data: Arc<RwLock<Data>>,
+pub struct SynthWrapper {
+    inner: Arc<Synth>,
+}
+
+pub struct Synth {
+    data: Arc<DataWriter>,
     utilization: Arc<AtomicU32>,
     debug: Arc<AtomicI32>,
-    last_instant: Instant,
+    last_instant: Mutex<Instant>,
     sample_rate: u32,
-    studied_samples: u32,
-    // there are 128 possible midi notes, for each note we need to store a cache of the computed values for each frame
-    sum_cache: [Vec<f32>; 128],
-    cache_recompute_at: Option<u32>,
+    studied_samples: AtomicU32,
+
+    /// There are 128 possible midi notes and for each note we need to store a cache of the computed values for each frame after a note trigger.
+    /// We store two versions of the cache described above and write into whichever one is not currently being read out of to produce sound.
+    /// When a cache recompute finishes, we switch the active cache again. See `active_cache`.
+    sum_cache: [Mutex<[Vec<f32>; 128]>; 2],
+
+    /// Index for which cache is being used to produce audio. Valid values are 0 or 1.
+    active_cache: AtomicUsize,
 
     // there are 128 possible midi notes, each of which can be retriggered at a speed presumably less than the heap can deal with
-    active_midi_notes: [Vec<(SampleTime, MidiMessage<'static>)>; 128],
+    active_midi_notes: Mutex<[Vec<(SampleTime, MidiMessage<'static>)>; 128]>,
 
     midi_sequence_urid: URID<Sequence>,
     midi_event_urid: URID<MidiEvent>,
     midi_beat_urid: URID<Beat>,
 }
 
-impl Plugin for Amp {
+impl Plugin for SynthWrapper {
     type Ports = Ports;
 
     type InitFeatures = Features<'static>;
     type AudioFeatures = ();
 
     fn new(plugin_info: &PluginInfo, features: &mut Features) -> Option<Self> {
-        let data = Arc::new(RwLock::new(Data::new()));
+        let (invalidate_cache_send, invalidate_cache_read) = {
+            let (tx, rx) = mpsc::channel();
+            (Arc::new(tx), Arc::new(Mutex::new(rx)))
+        };
+        let reinvalidate_cache = Arc::new(AtomicBool::new(false));
+        let reinvalidate_cache_clone = reinvalidate_cache.clone();
+        let data = Arc::new(DataWriter::new(
+            invalidate_cache_send,
+            reinvalidate_cache,
+            Data::new(),
+        ));
+
         let data_clone = data.clone();
         let utilization = Arc::new(AtomicU32::new(0));
         let debug = Arc::new(AtomicI32::new(0));
@@ -82,7 +100,7 @@ impl Plugin for Amp {
                 ..Default::default()
             };
             eframe::run_native(
-                "Sketch-a-Spectrum",
+                "sketch freq",
                 options,
                 Box::new(|_cc| {
                     Ok(Box::new(Frontend {
@@ -105,138 +123,159 @@ impl Plugin for Amp {
             .unwrap();
         });
 
-        let data_read = data.read().unwrap();
-        let plot_duration = data_read.plot_duration;
+        let plot_duration = data.read_with(|data| data.plot_duration);
 
-        drop(data_read);
-
-        Some(Self {
+        let synth = Arc::new(Synth {
             data,
             sample_rate: plugin_info.sample_rate().round() as u32,
-            studied_samples: 0,
+            studied_samples: AtomicU32::new(0),
             utilization,
             debug,
-            last_instant: Instant::now(),
+            last_instant: Mutex::new(Instant::now()),
             sum_cache: std::array::from_fn(|_i| {
-                vec![0f32; (plugin_info.sample_rate().round() as f32 * plot_duration) as usize]
+                Mutex::new(std::array::from_fn(|_j| {
+                    vec![0f32; (plugin_info.sample_rate().round() as f32 * plot_duration) as usize]
+                }))
             }),
-            cache_recompute_at: None,
-            active_midi_notes: [const { vec![] }; 128],
+            active_cache: AtomicUsize::new(0),
+            active_midi_notes: Mutex::new([const { vec![] }; 128]),
             midi_sequence_urid: features.urid_map.map_type().unwrap(),
             midi_beat_urid: features.urid_map.map_type().unwrap(),
             midi_event_urid: features.urid_map.map_type().unwrap(),
-        })
+        });
+
+        let synth_clone = synth.clone();
+        std::thread::spawn(move || {
+            compute_cache(
+                synth_clone,
+                &*invalidate_cache_read.lock().unwrap(),
+                reinvalidate_cache_clone,
+            );
+        });
+
+        Some(Self { inner: synth })
     }
 
     fn run(&mut self, ports: &mut Ports, _features: &mut (), _: u32) {
-        let mut data = self.data.write().unwrap();
+        let inner = &self.inner;
+        let unused = {
+            let mut lock = inner.last_instant.lock().unwrap();
+            let ret = lock.elapsed().as_millis();
+            *lock = Instant::now();
+            ret
+        };
 
+        let plot_duration = inner.data.read_with(|data| data.plot_duration);
+
+        let mut active_midi_notes = inner.active_midi_notes.lock().unwrap();
         ports
             .midi_events
-            .read(self.midi_sequence_urid, self.midi_beat_urid)
+            .read(inner.midi_sequence_urid, inner.midi_beat_urid)
             .unwrap()
             .for_each(|(_time_stamp, atom)| {
-                let event = atom.read(self.midi_event_urid, ()).unwrap();
+                let event = atom.read(inner.midi_event_urid, ()).unwrap();
 
                 let wmidi_msg = MidiMessage::try_from(event).unwrap();
 
                 //TODO: check channel
+                let _channel = wmidi_msg.channel();
 
-                if let wmidi::MidiMessage::NoteOn(_, note, vel) = wmidi_msg {
-                    let volume = u8::from(vel) as f32 / 127.0;
-                    self.active_midi_notes[u8::from(note) as usize]
-                        .push((self.studied_samples, wmidi_msg.clone()));
-                    println!("ON: {} at volume {}", note, volume);
+                if let wmidi::MidiMessage::NoteOn(_, note, _vel) = wmidi_msg {
+                    active_midi_notes[u8::from(note) as usize].push((
+                        inner.studied_samples.load(Ordering::SeqCst),
+                        wmidi_msg.clone(),
+                    ));
                 }
                 if let wmidi::MidiMessage::NoteOff(_, note, _vel) = wmidi_msg {
-                    println!("OFF: {}", note);
+                    active_midi_notes[u8::from(note) as usize].push((
+                        inner.studied_samples.load(Ordering::SeqCst),
+                        wmidi_msg.clone(),
+                    ));
                 }
             });
 
-        let unused = self.last_instant.elapsed().as_millis();
-        self.last_instant = Instant::now();
-
         let coef = 10f32.powf((*ports.gain).min(90f32).max(-90f32) * 0.05);
 
-        //set point at which cache must be recomputed from
-        if self.cache_recompute_at.is_none() || data.reinvalidate_cache {
-            data.reinvalidate_cache = false;
-            self.cache_recompute_at = Some(self.studied_samples);
+        // respond to notes and play sound
+        let active_cache_i = inner.active_cache.load(Ordering::SeqCst);
+        let active_cache = inner.sum_cache[active_cache_i].lock().unwrap();
+        for out_frame in ports.output.iter_mut() {
+            *out_frame = 0f32;
+            for pitch_index in 0..active_midi_notes.len() {
+                for active_note_index in (0..active_midi_notes[pitch_index].len()).rev() {
+                    let since_start = inner.studied_samples.load(Ordering::SeqCst)
+                        - active_midi_notes[pitch_index][active_note_index].0;
+                    if since_start >= (inner.sample_rate as f32 * plot_duration) as u32 {
+                        active_midi_notes[pitch_index].remove(active_note_index);
+                    } else {
+                        let msg = &active_midi_notes[pitch_index][active_note_index].1;
+                        let intensity = if let wmidi::MidiMessage::NoteOn(_, _note, vel) = msg {
+                            10f32.powf(u8::from(*vel) as f32 / 128f32)
+                        } else if let wmidi::MidiMessage::NoteOff(_, _note, vel) = msg {
+                            10f32.powf((128 - u8::from(*vel)) as f32 / 128f32)
+                        } else {
+                            1f32
+                        };
+
+                        *out_frame +=
+                            active_cache[pitch_index][since_start as usize] * coef * intensity;
+                    }
+                }
+            }
         }
 
-        if data.caches_invalidated {
-            //do recompute here
-            for out_frame in ports.output.iter_mut() {
-                let time_elapsed = self.studied_samples as f64 / self.sample_rate as f64;
-                let loop_index =
-                    self.studied_samples % (self.sample_rate as f32 * data.plot_duration) as u32;
-                let loop_time = (time_elapsed % data.plot_duration as f64) as f32;
-                let loop_time_subdivision_index =
-                    (loop_time * data.second_subdivisions as f32) as usize;
+        // update utilization statistic
+        {
+            let mut lock = inner.last_instant.lock().unwrap();
+            let used = lock.elapsed().as_millis();
+            inner.utilization.store(
+                (used as f32 / unused as f32 * 100f32) as u32,
+                Ordering::Relaxed,
+            );
+            *lock = Instant::now();
+        }
+    }
+}
 
+fn compute_cache(synth: Arc<Synth>, invalidate: &Receiver<()>, reinvalidate: Arc<AtomicBool>) {
+    loop {
+        //wait for signal from frontend to do a computation of the cache
+        invalidate.recv().unwrap();
+
+        synth.data.read_with(|data| {
+            let active_cache_i = synth.active_cache.load(Ordering::SeqCst);
+            let mut active_cache = synth.sum_cache[(active_cache_i + 1) % 2].lock().unwrap();
+            'sample: for sample in 0..(synth.sample_rate as f32 * data.plot_duration) as u32 {
                 for midi_note in 0..128 {
                     let mut sum = 0f32;
                     for frequency_index in 0..data.frequency_count {
                         let frequency = Note::from_u8_lossy(midi_note).to_freq_f32()
                             * 2f32.powf(
-                                *ports.pitch_scale
-                                    + (frequency_index as i32 - data.frequency_count as i32 / 2)
-                                        as f32
-                                        / (12 * data.semitone_divisions) as f32,
+                                (frequency_index as i32 - data.frequency_count as i32 / 2) as f32
+                                    / (12 * data.semitone_divisions) as f32,
                             )
-                            * *ports.center_frequency;
+                            * 440f32;
 
-                        let amplitude =
-                            data.amplitude_plot[frequency_index as usize * data.x_width_plot()
-                                + loop_time_subdivision_index] as f32;
+                        let amplitude = data.amplitude_plot
+                            [frequency_index as usize * data.x_width_plot() + sample as usize]
+                            as f32;
 
                         if amplitude > 1f32 {
-                            sum += (loop_time * frequency * 2f32 * f32::consts::PI).sin()
+                            sum += (sample as f32 / synth.sample_rate as f32
+                                * frequency
+                                * 2f32
+                                * f32::consts::PI)
+                                .sin()
                                 * 10f32.powf(amplitude / 255f32 - 1f32);
                         }
+
+                        if reinvalidate.fetch_not(Ordering::SeqCst) {
+                            break 'sample;
+                        }
                     }
-                    self.sum_cache[midi_note as usize][loop_index as usize] = sum;
+                    active_cache[midi_note as usize][sample as usize] = sum;
                 }
-
-                *out_frame = coef * sum as f32;
-                self.studied_samples += 1;
             }
-
-            //check if enough samples have been computed to consider the cache updated
-            if self.studied_samples - self.cache_recompute_at.unwrap()
-                >= (self.sample_rate as f32 * data.plot_duration) as u32
-            {
-                println!("done with recompute");
-                data.caches_invalidated = false;
-                self.cache_recompute_at = None;
-            }
-            //pretend that the cache was always fine by subtracting the timestep and proceeding as normal
-            self.studied_samples -= ports.output.len() as u32;
-        }
-
-        // use precomputed values to write to output, barring considerations like velocity
-        for out_frame in ports.output.iter_mut() {
-            let loop_index =
-                self.studied_samples % (self.sample_rate as f32 * data.plot_duration) as u32;
-            *out_frame = self.sum_cache[loop_index as usize] * coef;
-            self.studied_samples += 1;
-        }
-
-        // update utilization statistic
-        let used = self.last_instant.elapsed().as_millis();
-        self.utilization.store(
-            (used as f32 / unused as f32 * 100f32) as u32,
-            Ordering::Relaxed,
-        );
-        self.last_instant = Instant::now();
-
-        //OTHERWISE MUST RECOMPUTE SUM CACHE
-
-        let used = self.last_instant.elapsed().as_millis();
-        self.utilization.store(
-            (used as f32 / unused as f32 * 100f32) as u32,
-            Ordering::Relaxed,
-        );
-        self.last_instant = Instant::now();
+        });
     }
 }
