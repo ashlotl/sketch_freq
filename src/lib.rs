@@ -1,3 +1,4 @@
+pub mod aabb;
 pub mod frontend;
 pub mod lv2_impl;
 pub mod shared_data;

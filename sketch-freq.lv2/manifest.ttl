@@ -2,6 +2,6 @@
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 
 <https://example.com/changethislater> a lv2:Plugin .
-<https://example.com/changethislater> lv2:binary <libsketch_freq.so> .
+<https://example.com/changethislater> lv2:binary <libsketch_freq.release.so> .
 
 <https://example.com/changethislater> rdfs:seeAlso <sketch-freq.ttl> .

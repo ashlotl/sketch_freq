@@ -8,22 +8,26 @@ use std::{
     },
 };
 
+use crate::{aabb::AABB, lv2_impl::Synth};
+
+#[derive(Clone)]
+pub struct Region {
+    pub bounding_box: AABB,
+    pub data: Vec<f32>,
+}
+
 pub struct DataWriter {
     inner: RwLock<Data>,
-    invalidate_cache: Arc<Sender<()>>,
-    reinvalidate_cache: Arc<AtomicBool>,
+    recompute_cache: Arc<Sender<()>>,
+    interrupt: Arc<AtomicBool>,
 }
 
 impl DataWriter {
-    pub fn new(
-        invalidate_cache: Arc<Sender<()>>,
-        reinvalidate_cache: Arc<AtomicBool>,
-        data: Data,
-    ) -> Self {
+    pub fn new(recompute_cache: Arc<Sender<()>>, interrupt: Arc<AtomicBool>, data: Data) -> Self {
         Self {
             inner: RwLock::new(data),
-            invalidate_cache,
-            reinvalidate_cache,
+            recompute_cache,
+            interrupt,
         }
     }
 
@@ -31,38 +35,40 @@ impl DataWriter {
         with(&self.inner.read().unwrap())
     }
 
-    /// TO SAVE ON HEADACHES, DO NOT USE THIS FUNCTION IN MULTIPLE THREADS
-    pub fn write_with(&self, mut with: impl FnMut(&mut Data)) {
-        let data = self.inner.read().unwrap();
-        // interrupt current operations on `Data`, namely the recomputation of the cache in `lv2_impl`
-        self.reinvalidate_cache.store(true, Ordering::SeqCst);
-        drop(data);
+    pub fn write_with(&self, synth: &Synth, mut with: impl FnMut(&mut Data) -> Vec<usize>) {
+        self.interrupt.store(true, Ordering::SeqCst);
         let mut write_lock = self.inner.write().unwrap();
-        // successfully getting the write_lock indicates that the reinvalidation was registered or was unnecessary,
-        // so we set it back to false to avoid spurious reinvalidation
-        self.reinvalidate_cache.store(false, Ordering::SeqCst);
-        with(&mut write_lock);
+        self.interrupt.store(false, Ordering::SeqCst);
+        let update_chunks = with(&mut write_lock);
         drop(write_lock);
-        //let `lv2_impl` know that it can resume
-        self.invalidate_cache.send(()).unwrap();
+
+        for chunk_i in &update_chunks {
+            let Some(chunk) = synth.sum_cache.get(*chunk_i) else {
+                continue;
+            };
+            chunk
+                .invalidate
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        self.recompute_cache.send(()).unwrap();
     }
 }
 
 pub struct Data {
-    pub semitone_divisions: usize,
-    pub frequency_count: u32,
+    pub frequency_divisions_per_semitone: usize,
+    pub frequency_count: usize,
 
-    /// (in seconds)
-    pub plot_duration: f32,
-    pub second_subdivisions: u32,
+    /// Length of amplitude and other plots in samples.
+    pub plot_length: usize,
 
-    pub amplitude_plot: Vec<u8>,
-    pub modulation_plot: Vec<u8>,
-    pub pan_plot: Vec<u8>,
+    pub amplitude_plot: Vec<f32>,
+    pub modulation_plot: Vec<f32>,
+    pub pan_plot: Vec<f32>,
 }
 
 impl Index<usize> for Data {
-    type Output = Vec<u8>;
+    type Output = Vec<f32>;
     fn index(&self, index: usize) -> &Self::Output {
         match index {
             0 => &self.amplitude_plot,
@@ -86,28 +92,23 @@ impl IndexMut<usize> for Data {
 
 impl Data {
     /// Creates a new data struct that has reasonable defaults
-    pub fn new() -> Self {
+    pub fn new(sample_rate: usize) -> Self {
         let frequency_count = 352;
-        let plot_duration = 2f32;
-        let second_subdivisions = 64;
 
-        let x_width = plot_duration * second_subdivisions as f32;
-        let plot_size = (x_width as u32 * frequency_count) as usize;
+        let plot_length = sample_rate * 2;
+
+        let plot_size = (plot_length * frequency_count) as usize;
 
         Self {
-            semitone_divisions: 4,
+            frequency_divisions_per_semitone: 4,
             frequency_count,
-            plot_duration,
-            second_subdivisions,
 
-            amplitude_plot: vec![0; plot_size],
-            modulation_plot: vec![0; plot_size],
-            pan_plot: vec![0; plot_size],
+            plot_length,
+
+            amplitude_plot: vec![0f32; plot_size],
+            modulation_plot: vec![0f32; plot_size],
+            pan_plot: vec![0f32; plot_size],
         }
-    }
-
-    pub fn x_width_plot(&self) -> usize {
-        (self.plot_duration * self.second_subdivisions as f32) as usize
     }
 
     pub fn construct_rgba_buffer_from_plots(
@@ -115,35 +116,76 @@ impl Data {
         r_channel: usize,
         g_channel: usize,
         b_channel: usize,
-    ) -> Vec<u8> {
-        let x_width = self.x_width_plot();
+        x_resolution: usize,
+        buffer: &mut [u8],
+        render_selection: AABB,
+    ) {
+        let ratio = self.plot_length / x_resolution;
 
-        let minimum_capacity = x_width * self.frequency_count as usize * 4;
-        let mut buffer = Vec::with_capacity(minimum_capacity);
+        for freq_i in render_selection.top()..render_selection.bottom().min(self.frequency_count) {
+            let mut sum_r = 0f32;
+            let mut sum_g = 0f32;
+            let mut sum_b = 0f32;
+            for sample_i in (render_selection.left() as isize - ratio as isize).max(0) as usize
+                ..render_selection.right().min(self.plot_length)
+            {
+                let plot_index = freq_i * self.plot_length + sample_i;
+                sum_r += self[r_channel][plot_index];
+                sum_g += self[g_channel][plot_index];
+                sum_b += self[b_channel][plot_index];
 
-        for i in 0..minimum_capacity {
-            match i % 4 {
-                0 => buffer.push(self[r_channel][i / 4]),
-                1 => buffer.push(self[g_channel][i / 4]),
-                2 => buffer.push(self[b_channel][i / 4]),
-                3 => buffer.push(255),
-                _ => unreachable!(),
+                if sample_i % ratio == 0 && sample_i >= render_selection.left() {
+                    buffer[plot_index / ratio * 4] =
+                        (sum_r * 255f32 / ratio as f32).min(255f32) as u8;
+                    buffer[plot_index / ratio * 4 + 1] =
+                        (sum_g * 255f32 / ratio as f32).min(255f32) as u8;
+                    buffer[plot_index / ratio * 4 + 2] =
+                        (sum_b * 255f32 / ratio as f32).min(255f32) as u8;
+                    buffer[plot_index / ratio * 4 + 3] = 255;
+
+                    sum_r = 0f32;
+                    sum_g = 0f32;
+                    sum_b = 0f32;
+                }
             }
         }
+    }
 
-        buffer
+    pub fn get_region(&self, selection: AABB, brush_color: &ChannelSelection) -> Region {
+        let mut ret = vec![0f32; selection.area()];
+        for y in selection.top()..selection.bottom() {
+            let region_y = y - selection.top();
+            ret[region_y * selection.width()..(region_y + 1) * selection.width()].copy_from_slice(
+                &self[brush_color.index()][y * self.plot_length + selection.left()
+                    ..y * self.plot_length + selection.right()],
+            );
+        }
+        Region {
+            bounding_box: selection,
+            data: ret,
+        }
+    }
+
+    pub fn set_region(&mut self, region: &Region, brush_color: &ChannelSelection) -> AABB {
+        for y in region.bounding_box.top()..region.bounding_box.bottom() {
+            let self_offset = y * self.plot_length + region.bounding_box.left();
+            let region_offset = (y - region.bounding_box.top()) * region.bounding_box.width();
+            self[brush_color.index()][self_offset..self_offset + region.bounding_box.width()]
+                .copy_from_slice(
+                    &region.data[region_offset..region_offset + region.bounding_box.width()],
+                );
+        }
+        region.bounding_box.clone()
     }
 
     /// (takes coordinates in the space of the plot, not global coordinates)
     pub fn for_pixel_in_brush_range(
-        &mut self,
+        &self,
         brush_pos: (f32, f32),
         brush_radii: (f32, f32),
         brush_color: &ChannelSelection,
-        for_each: impl Fn((usize, usize), &mut u8),
-    ) {
-        let x_width = self.x_width_plot();
-
+        mut for_each: impl FnMut((usize, usize), f32) -> f32,
+    ) -> Option<Region> {
         let channel_index = brush_color.index();
 
         let start_pos = (
@@ -151,27 +193,23 @@ impl Data {
             (brush_pos.1 - brush_radii.1).max(0f32) as usize,
         );
         let end_pos = (
-            (brush_pos.0 + brush_radii.0).round().min(x_width as f32) as usize,
-            (brush_pos.1 + brush_radii.1)
-                .round()
-                .min(self.frequency_count as f32) as usize,
+            ((brush_pos.0 + brush_radii.0).round() as usize + 1).min(self.plot_length),
+            ((brush_pos.1 + brush_radii.1).round() as usize).min(self.frequency_count),
         );
+
+        let Some(bounding_box) = AABB::new(start_pos, end_pos) else {
+            return None;
+        };
+        let mut region = self.get_region(bounding_box, brush_color);
 
         for y in start_pos.1..end_pos.1 {
             for x in start_pos.0..end_pos.0 {
-                let x = x;
-                let y = y;
-                let dx = x as f32 - brush_pos.0;
-                let dy = y as f32 - brush_pos.1;
-
-                //check if inside ellipse
-                if dx * dx / brush_radii.0 + dy * dy / brush_radii.1 > 1f32 {
-                    continue;
-                }
-
-                for_each((x, y), &mut self[channel_index][y * x_width + x]);
+                region.data[region.bounding_box.width() * (y - start_pos.1) + x - start_pos.0] =
+                    for_each((x, y), self[channel_index][y * self.plot_length + x]);
             }
         }
+
+        Some(region)
     }
 }
 
